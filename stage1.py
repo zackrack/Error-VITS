@@ -52,6 +52,10 @@ _RUNTIME_PACKAGES = {
     "scipy": "scipy",
     "torch": "torch",
 }
+_TEXT_PACKAGES = {
+    "phonemizer": "phonemizer",
+    "unidecode": "Unidecode",
+}
 _BUILD_PACKAGES = {
     "Cython": "Cython",
 }
@@ -116,6 +120,11 @@ _STRESS_OVERRIDES = {
 # passed through to VITS as phrase/sentence boundary hints.
 _PUNCTUATION = set(";:,.!?¡¿—…\"«»“”")
 _PHONE_RE = re.compile(r"^([A-Z]+)([0-2]?)$")
+_TAG_RE = re.compile(
+    r"<(phoneme|cmu|ipa)(?P<attrs>[^>]*)>(?P<body>.*?)</\1>",
+    re.IGNORECASE | re.DOTALL,
+)
+_ATTR_RE = re.compile(r"""(\w+)\s*=\s*(["'])(.*?)\2""")
 
 
 def missing_modules(modules_to_packages: Dict[str, str]) -> List[str]:
@@ -284,12 +293,167 @@ def default_config_path(model_name: str) -> str:
     return str(_REPO_ROOT / MODEL_ASSETS[model_name]["config"])
 
 
-def cmu39_to_ipa(cmu39: str, keep_stress: bool = True) -> str:
+def collapse_whitespace(text: str) -> str:
+    """Collapse repeated whitespace and strip leading/trailing whitespace."""
+
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def validate_ipa(ipa: str) -> str:
+    """Validate that an IPA string only contains VITS symbols."""
+
+    unsupported = sorted({symbol for symbol in ipa if symbol not in symbols})
+    if unsupported:
+        raise ValueError(
+            "IPA contains symbols not present in this VITS model's symbol table: {}".format(
+                " ".join(unsupported)
+            )
+        )
+    return ipa
+
+
+def ensure_text_dependencies(install_missing: bool = True) -> None:
+    """Ensure packages needed for English text-to-IPA cleaning are importable."""
+
+    missing = missing_modules(_TEXT_PACKAGES)
+    if missing and not install_missing:
+        raise RuntimeError(
+            "Text input requires missing Python packages: {}. Re-run without "
+            "--no-install-missing or install them manually.".format(" ".join(missing))
+        )
+    install_packages(missing)
+
+
+def text_to_ipa(text: str, cleaner_names: Optional[List[str]] = None) -> str:
+    """Convert ordinary text to the same IPA style used by repository cleaners."""
+
+    from text import cleaners
+
+    cleaner_names = cleaner_names or ["english_cleaners2"]
+    cleaned = text
+    for cleaner_name in cleaner_names:
+        cleaner = getattr(cleaners, cleaner_name)
+        cleaned = cleaner(cleaned)
+    return validate_ipa(cleaned)
+
+
+def parse_tag_attrs(attrs: str) -> Dict[str, str]:
+    """Parse simple XML-style key="value" tag attributes."""
+
+    return {match.group(1).lower(): match.group(3) for match in _ATTR_RE.finditer(attrs)}
+
+
+def looks_like_cmu(text: str) -> bool:
+    """Return True when text appears to be only CMU/ARPAbet tokens."""
+
+    saw_phone = False
+    for raw_token in text.split():
+        token = raw_token.strip().upper()
+        while token and token[0] in _PUNCTUATION:
+            token = token[1:]
+        while token and token[-1] in _PUNCTUATION:
+            token = token[:-1]
+        if not token:
+            continue
+        match = _PHONE_RE.match(token)
+        if match is None or match.group(1) not in CMU39_TO_IPA:
+            return False
+        saw_phone = True
+    return saw_phone
+
+
+def render_phoneme_tag(
+    tag_name: str,
+    attrs: str,
+    body: str,
+    keep_stress: bool = True,
+) -> str:
+    """Render a <phoneme>, <cmu>, or <ipa> tag body to model-compatible IPA."""
+
+    attr_map = parse_tag_attrs(attrs)
+    alphabet = attr_map.get("alphabet", attr_map.get("type", tag_name)).lower()
+    if alphabet in {"phoneme", "arpabet", "cmu39", "cmu"}:
+        return cmu39_to_ipa(body, keep_stress=keep_stress, phone_separator="")
+    if alphabet == "ipa":
+        return validate_ipa(body.strip())
+    raise ValueError(
+        "Unsupported phoneme alphabet '{}'. Use CMU/ARPAbet or IPA.".format(alphabet)
+    )
+
+
+def input_needs_text_cleaners(input_text: str, input_format: str) -> bool:
+    """Return True when an input mode may need the configured text cleaners."""
+
+    if input_format == "text":
+        return True
+    if input_format != "mixed":
+        return False
+    if not _TAG_RE.search(input_text):
+        return not looks_like_cmu(input_text)
+
+    position = 0
+    for match in _TAG_RE.finditer(input_text):
+        if input_text[position:match.start()].strip():
+            return True
+        position = match.end()
+    return bool(input_text[position:].strip())
+
+
+def input_to_ipa(
+    input_text: str,
+    input_format: str = "mixed",
+    keep_stress: bool = True,
+    text_cleaners: Optional[List[str]] = None,
+) -> str:
+    """Convert text, IPA, CMU, or tagged mixed input to model-compatible IPA."""
+
+    if input_format == "ipa":
+        return validate_ipa(input_text)
+    if input_format == "cmu":
+        return cmu39_to_ipa(input_text, keep_stress=keep_stress, phone_separator="")
+    if input_format == "text":
+        return text_to_ipa(input_text, cleaner_names=text_cleaners)
+    if input_format != "mixed":
+        raise ValueError("Unsupported input format '{}'".format(input_format))
+    if not _TAG_RE.search(input_text) and looks_like_cmu(input_text):
+        return cmu39_to_ipa(input_text, keep_stress=keep_stress, phone_separator="")
+
+    pieces = []
+    position = 0
+    for match in _TAG_RE.finditer(input_text):
+        if match.start() > position:
+            text_piece = input_text[position:match.start()]
+            if text_piece.strip():
+                pieces.append(text_to_ipa(text_piece, cleaner_names=text_cleaners))
+        pieces.append(
+            render_phoneme_tag(
+                match.group(1),
+                match.group("attrs"),
+                match.group("body"),
+                keep_stress=keep_stress,
+            )
+        )
+        position = match.end()
+    if position < len(input_text):
+        text_piece = input_text[position:]
+        if text_piece.strip():
+            pieces.append(text_to_ipa(text_piece, cleaner_names=text_cleaners))
+
+    return validate_ipa(collapse_whitespace(" ".join(piece for piece in pieces if piece)))
+
+
+def cmu39_to_ipa(
+    cmu39: str,
+    keep_stress: bool = True,
+    phone_separator: str = "",
+) -> str:
     """Convert a whitespace-delimited CMU-39/ARPAbet string to VITS IPA text.
 
     Tokens may include optional CMUdict stress digits on vowels, e.g.
     ``HH AH0 L OW1``. Punctuation may be attached to tokens or separated by
-    spaces, e.g. ``W ER1 L D !`` or ``W ER1 L D!``.
+    spaces, e.g. ``W ER1 L D !`` or ``W ER1 L D!``. By default, phones are
+    joined without spaces because the pretrained VITS filelists use spaces
+    primarily as word boundaries, not as phone boundaries.
     """
 
     ipa_tokens = []
@@ -327,7 +491,7 @@ def cmu39_to_ipa(cmu39: str, keep_stress: bool = True) -> str:
             leading_punctuation + stress_mark + ipa_phone + trailing_punctuation
         )
 
-    ipa = " ".join(ipa_tokens)
+    ipa = phone_separator.join(ipa_tokens)
     unsupported = sorted({symbol for symbol in ipa if symbol not in symbols})
     if unsupported:
         raise ValueError(
@@ -374,7 +538,7 @@ def build_model(hps, checkpoint_path: str, device):
 
 
 def synthesize(
-    cmu39: str,
+    input_text: str,
     config_path: Optional[str],
     checkpoint_path: Optional[str],
     output_path: str,
@@ -385,6 +549,7 @@ def synthesize(
     max_len: Optional[int] = None,
     device: str = "auto",
     keep_stress: bool = True,
+    input_format: str = "mixed",
     model_name: str = "ljs",
     download_dir: str = "checkpoints",
     download: bool = True,
@@ -392,7 +557,7 @@ def synthesize(
     install_missing: bool = True,
     build_extensions: bool = True,
 ):
-    """Run CMU-39 -> IPA -> VITS inference and write a WAV file."""
+    """Run input text/tags/phonemes -> IPA -> VITS inference and write a WAV file."""
 
     ensure_runtime_environment(
         install_missing=install_missing,
@@ -418,7 +583,15 @@ def synthesize(
     )
 
     hps = utils.get_hparams_from_file(str(resolved_config_path))
-    ipa = cmu39_to_ipa(cmu39, keep_stress=keep_stress)
+    if input_needs_text_cleaners(input_text, input_format):
+        ensure_text_dependencies(install_missing=install_missing)
+    ipa = input_to_ipa(
+        input_text,
+        input_format=input_format,
+        keep_stress=keep_stress,
+        text_cleaners=list(getattr(hps.data, "text_cleaners", ["english_cleaners2"])),
+    )
+    print("IPA:", ipa)
     text = ipa_to_tensor(ipa, hps.data.add_blank).to(selected_device)
     net_g = build_model(hps, str(resolved_checkpoint_path), selected_device)
 
@@ -452,14 +625,27 @@ def synthesize(
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Generate speech from a CMU-39/ARPAbet phoneme string using VITS. "
+            "Generate speech from text, IPA, or tagged phoneme input using VITS. "
             "By default, the script downloads the LJ Speech checkpoint and "
             "prepares local runtime pieces the first time it runs."
         )
     )
     parser.add_argument(
-        "cmu39",
-        help="Whitespace-delimited CMU-39 phones, e.g. 'HH AH0 L OW1 W ER1 L D'.",
+        "input",
+        help=(
+            "Input to synthesize. Default mixed mode accepts text plus tags like "
+            "'<phoneme>W AE1 B AH0 T</phoneme>' or '<ipa>wˈæbət</ipa>'."
+        ),
+    )
+    parser.add_argument(
+        "--input-format",
+        default="mixed",
+        choices=("mixed", "text", "ipa", "cmu"),
+        help=(
+            "How to interpret the input. mixed accepts ordinary text plus "
+            "<phoneme>/<cmu>/<ipa> tags; cmu expects plain CMU/ARPAbet; ipa "
+            "expects already-cleaned IPA; text runs the configured text cleaners."
+        ),
     )
     parser.add_argument(
         "--model",
@@ -533,10 +719,8 @@ def parse_args():
 
 def main():
     args = parse_args()
-    ipa = cmu39_to_ipa(args.cmu39, keep_stress=not args.no_stress)
-    print("IPA:", ipa)
     synthesize(
-        args.cmu39,
+        args.input,
         config_path=args.config,
         checkpoint_path=args.checkpoint,
         output_path=args.output,
@@ -547,6 +731,7 @@ def main():
         max_len=args.max_len,
         device=args.device,
         keep_stress=not args.no_stress,
+        input_format=args.input_format,
         model_name=args.model,
         download_dir=args.download_dir,
         download=not args.no_download,
