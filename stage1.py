@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """Synthesize speech from a CMU-39/ARPAbet phoneme string with VITS.
 
-The existing checkpoints in this repository are trained on eSpeak-style IPA
-symbols, so this stage converts CMU-39 phoneme tokens to the matching IPA
-symbol inventory before feeding the sequence directly to VITS.
+This stage accepts a whitespace-delimited CMU-39/ARPAbet string, converts it to
+VITS-compatible IPA symbols, automatically prepares the local runtime assets
+when requested, and writes synthesized speech to a WAV file.
 """
 
-from __future__ import annotations
-
 import argparse
+import hashlib
+import importlib.util
+import os
 import re
+import subprocess
+import sys
+import urllib.request
 from pathlib import Path
+from typing import Dict, Iterable, List, Optional
 
 
 _pad = "_"
@@ -23,6 +28,34 @@ _letters_ipa = (
 )
 symbols = [_pad] + list(_punctuation) + list(_letters) + list(_letters_ipa)
 _symbol_to_id = {symbol: index for index, symbol in enumerate(symbols)}
+
+
+MODEL_ASSETS = {
+    "ljs": {
+        "description": "Single-speaker LJ Speech checkpoint",
+        "config": "configs/ljs_base.json",
+        "checkpoint": "pretrained_ljs.pth",
+        "url": "https://huggingface.co/csukuangfj/vits-ljs/resolve/main/pretrained_ljs.pth",
+        "sha256": "c94fb49d08ba90c598de16e7d5dec8d26bf225c1cf193a4fba05eb2dbda5a561",
+    },
+    "vctk": {
+        "description": "Multi-speaker VCTK checkpoint",
+        "config": "configs/vctk_base.json",
+        "checkpoint": "pretrained_vctk.pth",
+        "url": "https://huggingface.co/csukuangfj/vits-vctk/resolve/main/pretrained_vctk.pth",
+        "sha256": "ab981615c443d935fc3a89b08137df544a1175bad99bcbbc9f59e7c3d4930043",
+    },
+}
+
+_RUNTIME_PACKAGES = {
+    "numpy": "numpy",
+    "scipy": "scipy",
+    "torch": "torch",
+}
+_BUILD_PACKAGES = {
+    "Cython": "Cython",
+}
+_REPO_ROOT = Path(__file__).resolve().parent
 
 
 # CMUdict/ARPAbet's core 39 phonemes mapped to the IPA symbols used by the
@@ -85,6 +118,172 @@ _PUNCTUATION = set(";:,.!?¡¿—…\"«»“”")
 _PHONE_RE = re.compile(r"^([A-Z]+)([0-2]?)$")
 
 
+def missing_modules(modules_to_packages: Dict[str, str]) -> List[str]:
+    """Return package names for modules that are not importable."""
+
+    return [
+        package_name
+        for module_name, package_name in modules_to_packages.items()
+        if importlib.util.find_spec(module_name) is None
+    ]
+
+
+def install_packages(packages: Iterable[str]) -> None:
+    """Install missing Python packages into the current interpreter."""
+
+    packages = list(dict.fromkeys(packages))
+    if not packages:
+        return
+    print("Installing missing Python packages:", " ".join(packages))
+    subprocess.check_call([sys.executable, "-m", "pip", "install", *packages])
+
+
+def ensure_python_dependencies(install_missing: bool = True) -> None:
+    """Ensure packages needed for VITS inference are importable."""
+
+    missing = missing_modules(_RUNTIME_PACKAGES)
+    if missing and not install_missing:
+        raise RuntimeError(
+            "Missing Python packages: {}. Re-run without --no-install-missing "
+            "or install them manually.".format(" ".join(missing))
+        )
+    install_packages(missing)
+
+
+def monotonic_align_built() -> bool:
+    """Return True when the Cython monotonic alignment extension is present."""
+
+    return bool(list((_REPO_ROOT / "monotonic_align").glob("core*.so"))) or bool(
+        list((_REPO_ROOT / "monotonic_align").glob("core*.pyd"))
+    )
+
+
+def ensure_monotonic_align(build_extension: bool = True, install_missing: bool = True) -> None:
+    """Build the monotonic alignment extension required by models.py imports."""
+
+    if monotonic_align_built():
+        return
+    if not build_extension:
+        raise RuntimeError(
+            "monotonic_align extension is not built. Re-run without "
+            "--no-build-extensions or run `cd monotonic_align && "
+            "python setup.py build_ext --inplace`."
+        )
+
+    missing = missing_modules(_BUILD_PACKAGES)
+    if missing and not install_missing:
+        raise RuntimeError(
+            "Missing build packages: {}. Re-run without --no-install-missing "
+            "or install them manually.".format(" ".join(missing))
+        )
+    install_packages(missing)
+
+    print("Building monotonic_align Cython extension...")
+    subprocess.check_call(
+        [sys.executable, "setup.py", "build_ext", "--inplace"],
+        cwd=str(_REPO_ROOT / "monotonic_align"),
+    )
+
+
+def ensure_runtime_environment(
+    install_missing: bool = True,
+    build_extensions: bool = True,
+) -> None:
+    """Prepare Python packages and local compiled extensions for inference."""
+
+    ensure_python_dependencies(install_missing=install_missing)
+    ensure_monotonic_align(
+        build_extension=build_extensions,
+        install_missing=install_missing,
+    )
+
+
+def sha256sum(path: Path) -> str:
+    """Compute a file's SHA-256 digest."""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as file_obj:
+        for block in iter(lambda: file_obj.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def download_file(url: str, destination: Path) -> None:
+    """Download a URL to a destination path with a simple progress indicator."""
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = destination.with_suffix(destination.suffix + ".part")
+    with urllib.request.urlopen(url) as response, temporary_path.open("wb") as file_obj:
+        total = int(response.headers.get("Content-Length") or 0)
+        downloaded = 0
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            file_obj.write(chunk)
+            downloaded += len(chunk)
+            if total:
+                percent = downloaded * 100 / total
+                print(
+                    "\rDownloading {}: {:.1f}%".format(destination.name, percent),
+                    end="",
+                    flush=True,
+                )
+        if total:
+            print()
+    os.replace(str(temporary_path), str(destination))
+
+
+def ensure_checkpoint(
+    model_name: str,
+    download_dir: str,
+    download: bool = True,
+    force_download: bool = False,
+) -> Path:
+    """Return a local checkpoint path, downloading and verifying if needed."""
+
+    asset = MODEL_ASSETS[model_name]
+    checkpoint_path = Path(download_dir) / asset["checkpoint"]
+    if not checkpoint_path.is_absolute():
+        checkpoint_path = _REPO_ROOT / checkpoint_path
+
+    expected_sha256 = asset["sha256"]
+    if checkpoint_path.exists() and not force_download:
+        actual_sha256 = sha256sum(checkpoint_path)
+        if actual_sha256 == expected_sha256:
+            return checkpoint_path
+        print(
+            "Existing checkpoint failed SHA-256 verification; downloading a fresh copy."
+        )
+
+    if not download:
+        raise FileNotFoundError(
+            "Checkpoint is missing or invalid at {} and downloads are disabled.".format(
+                checkpoint_path
+            )
+        )
+
+    print("Downloading {} to {}".format(asset["description"], checkpoint_path))
+    download_file(asset["url"], checkpoint_path)
+    actual_sha256 = sha256sum(checkpoint_path)
+    if actual_sha256 != expected_sha256:
+        if checkpoint_path.exists():
+            checkpoint_path.unlink()
+        raise RuntimeError(
+            "Downloaded checkpoint failed SHA-256 verification. Expected {}, got {}.".format(
+                expected_sha256,
+                actual_sha256,
+            )
+        )
+    return checkpoint_path
+
+
+def default_config_path(model_name: str) -> str:
+    """Return the repository config path for a built-in model asset."""
+
+    return str(_REPO_ROOT / MODEL_ASSETS[model_name]["config"])
+
+
 def cmu39_to_ipa(cmu39: str, keep_stress: bool = True) -> str:
     """Convert a whitespace-delimited CMU-39/ARPAbet string to VITS IPA text.
 
@@ -138,7 +337,7 @@ def cmu39_to_ipa(cmu39: str, keep_stress: bool = True) -> str:
     return ipa
 
 
-def ipa_to_sequence(ipa: str, add_blank: bool) -> list[int]:
+def ipa_to_sequence(ipa: str, add_blank: bool) -> List[int]:
     """Convert already-cleaned IPA text to VITS symbol IDs."""
 
     sequence = [_symbol_to_id[symbol] for symbol in ipa]
@@ -170,24 +369,35 @@ def build_model(hps, checkpoint_path: str, device):
         **hps.model
     ).to(device)
     net_g.eval()
-    utils.load_checkpoint(checkpoint_path, net_g, None)
+    utils.load_checkpoint(str(checkpoint_path), net_g, None)
     return net_g
 
 
 def synthesize(
     cmu39: str,
-    config_path: str,
-    checkpoint_path: str,
+    config_path: Optional[str],
+    checkpoint_path: Optional[str],
     output_path: str,
-    speaker_id=None,
+    speaker_id: Optional[int] = None,
     noise_scale: float = 0.667,
     noise_scale_w: float = 0.8,
     length_scale: float = 1.0,
-    max_len=None,
+    max_len: Optional[int] = None,
     device: str = "auto",
     keep_stress: bool = True,
+    model_name: str = "ljs",
+    download_dir: str = "checkpoints",
+    download: bool = True,
+    force_download: bool = False,
+    install_missing: bool = True,
+    build_extensions: bool = True,
 ):
     """Run CMU-39 -> IPA -> VITS inference and write a WAV file."""
+
+    ensure_runtime_environment(
+        install_missing=install_missing,
+        build_extensions=build_extensions,
+    )
 
     import torch
     from scipy.io.wavfile import write
@@ -199,18 +409,25 @@ def synthesize(
     else:
         selected_device = torch.device(device)
 
-    hps = utils.get_hparams_from_file(config_path)
+    resolved_config_path = config_path or default_config_path(model_name)
+    resolved_checkpoint_path = Path(checkpoint_path) if checkpoint_path else ensure_checkpoint(
+        model_name,
+        download_dir=download_dir,
+        download=download,
+        force_download=force_download,
+    )
+
+    hps = utils.get_hparams_from_file(str(resolved_config_path))
     ipa = cmu39_to_ipa(cmu39, keep_stress=keep_stress)
     text = ipa_to_tensor(ipa, hps.data.add_blank).to(selected_device)
-    net_g = build_model(hps, checkpoint_path, selected_device)
+    net_g = build_model(hps, str(resolved_checkpoint_path), selected_device)
 
     sid = None
     n_speakers = getattr(hps.data, "n_speakers", 0)
     if n_speakers > 0:
         if speaker_id is None:
-            raise ValueError(
-                "This config expects a multi-speaker checkpoint; pass --speaker-id."
-            )
+            speaker_id = 0
+            print("No speaker ID supplied for multi-speaker model; using speaker 0.")
         sid = torch.LongTensor([speaker_id]).to(selected_device)
 
     with torch.no_grad():
@@ -234,21 +451,56 @@ def synthesize(
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Generate speech from a CMU-39/ARPAbet phoneme string using VITS."
+        description=(
+            "Generate speech from a CMU-39/ARPAbet phoneme string using VITS. "
+            "By default, the script downloads the LJ Speech checkpoint and "
+            "prepares local runtime pieces the first time it runs."
+        )
     )
     parser.add_argument(
         "cmu39",
         help="Whitespace-delimited CMU-39 phones, e.g. 'HH AH0 L OW1 W ER1 L D'.",
     )
     parser.add_argument(
+        "--model",
+        default="ljs",
+        choices=tuple(sorted(MODEL_ASSETS)),
+        help="Built-in checkpoint to use when --checkpoint is omitted.",
+    )
+    parser.add_argument(
         "--config",
-        default="configs/ljs_base.json",
-        help="Path to the VITS JSON config used for the checkpoint.",
+        default=None,
+        help="Path to a VITS JSON config. Defaults to the selected built-in model config.",
     )
     parser.add_argument(
         "--checkpoint",
-        required=True,
-        help="Path to the generator checkpoint, e.g. logs/ljs_base/G_100000.pth.",
+        default=None,
+        help="Path to a generator checkpoint. Defaults to an auto-downloaded checkpoint.",
+    )
+    parser.add_argument(
+        "--download-dir",
+        default="checkpoints",
+        help="Directory for automatically downloaded checkpoints.",
+    )
+    parser.add_argument(
+        "--no-download",
+        action="store_true",
+        help="Do not download built-in checkpoints; require a valid local checkpoint.",
+    )
+    parser.add_argument(
+        "--force-download",
+        action="store_true",
+        help="Re-download the selected built-in checkpoint even if a local file exists.",
+    )
+    parser.add_argument(
+        "--no-install-missing",
+        action="store_true",
+        help="Do not pip-install missing runtime/build packages automatically.",
+    )
+    parser.add_argument(
+        "--no-build-extensions",
+        action="store_true",
+        help="Do not auto-build the monotonic_align Cython extension.",
     )
     parser.add_argument(
         "--output",
@@ -295,6 +547,12 @@ def main():
         max_len=args.max_len,
         device=args.device,
         keep_stress=not args.no_stress,
+        model_name=args.model,
+        download_dir=args.download_dir,
+        download=not args.no_download,
+        force_download=args.force_download,
+        install_missing=not args.no_install_missing,
+        build_extensions=not args.no_build_extensions,
     )
     print("Wrote:", args.output)
 
